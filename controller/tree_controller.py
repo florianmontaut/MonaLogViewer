@@ -84,7 +84,7 @@ class TreeController(QtCore.QObject):
         self.item_selected.emit(ctx)
 
     def _on_model_visibility_changed(self, ctx):
-        print(ctx)
+        
         self.visibility_changed.emit(ctx)
 
     

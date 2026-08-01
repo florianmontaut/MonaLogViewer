@@ -43,6 +43,7 @@ class PipelineTreeModel(QAbstractItemModel):
         # ✅ index par fichier
         self.cursor_Y_values_by_file = {}  # FileObject → list[float]
         self.signal_index_map = {}
+        self._items_by_object_id = {}
         # build signals
         self.build_tree()
 
@@ -95,30 +96,46 @@ class PipelineTreeModel(QAbstractItemModel):
     # ----------------- Build file subtree -----------------
 
     def add_file_subtree(self, file_obj: FileObject):
-        """
-        Ajoute un FileObject au modèle et notifie Qt correctement.
-        """
-        root_index = QModelIndex()
-        row = self.files_root.child_count()  # position d'insertion
+        parent_index = self.index_from_item(self.files_root)
+        row = self.files_root.child_count()
 
-        self.beginInsertRows(root_index, row, row)
-        file_item = TreeItem(file_obj, parent = self.files_root)
-        self.files_root.add_child(file_item)
+        file_item = TreeItem(file_obj, parent=self.files_root)
 
-        # Ajouter les signaux
         for sig in file_obj.signals.values():
-            self.add_signal_subtree(sig,file_item)
+            self._add_signal_subtree_silent(sig, file_item)
 
+        self.beginInsertRows(parent_index, row, row)
+        self.files_root.insert_child(row, file_item)
         self.endInsertRows()
-        #la ligne suivante évite les messages d'erreur après le chargement d'un nouveau
-        #fichier alors que les curseurs sont présents. En effet sans ces lignes,
-        #self.cursor_Y_values_by_file n'a pas été mis à jour
+
         if self.cursor_x is not None:
             self.updateCursorVal(self.cursor_x)
 
     # ----------------- Build signal subtree -----------------
+    def _add_signal_subtree_silent(self, sig: SignalObject, file_item: TreeItem):
+        """
+        Ajoute un signal et ses enfants dans l'arbre sans notification Qt.
 
+        À utiliser uniquement lorsque le parent est lui-même en cours d'insertion,
+        par exemple dans add_file_subtree().
+        """
+
+        sig_item = TreeItem(sig, parent=file_item)
+        file_item.add_child(sig_item)
+
+        for filt in sig.pipeline.values():
+            filt_item = TreeItem(filt, parent=sig_item)
+            sig_item.add_child(filt_item)
+
+        for analysis in sig.analyses.values():
+            analysis_item = TreeItem(analysis, parent=sig_item)
+            sig_item.add_child(analysis_item)
+            
     def add_signal_subtree(self, sig: SignalObject, parent:TreeItem):
+        """
+        Ajoute dynamiquement un SignalObject sous un FileObject déjà présent.
+        À utiliser hors insertion du fichier parent.
+        """
         sig_item = TreeItem(sig, parent = parent)
         parent.add_child(sig_item)
 
@@ -169,9 +186,34 @@ class PipelineTreeModel(QAbstractItemModel):
         root_item.children.pop(row)
         self.endRemoveRows()
 
-    def _emit_visibility_context(self, ctx):
-        self.visibility_changed.emit(ctx)
+    def _emit_children_check_state_changed(self, parent_item: TreeItem):
+        if parent_item.child_count() == 0:
+            return
 
+        parent_index = self.index_from_item(parent_item)
+
+        top_left = self.index(0, 0, parent_index)
+        bottom_right = self.index(parent_item.child_count() - 1, 0, parent_index)
+
+        if top_left.isValid() and bottom_right.isValid():
+            self.dataChanged.emit(
+                top_left,
+                bottom_right,
+                [Qt.ItemDataRole.CheckStateRole]
+            )
+            
+    def _emit_check_state_refresh_for_item(self, item: TreeItem):
+        idx = self.index_from_item(item)
+
+        if idx.isValid():
+            self.dataChanged.emit(
+                idx,
+                idx,
+                [Qt.ItemDataRole.CheckStateRole]
+            )
+
+        self._emit_children_check_state_changed(item)
+        
     def _emit_subtree_changed(self, item):
         """
         Notifie Qt que l'état checkable de tout le sous-arbre peut avoir changé.
@@ -191,6 +233,13 @@ class PipelineTreeModel(QAbstractItemModel):
             return
         self.node_event.emit(ModelChangeEvent(action=action,context=ctx))
 
+    def _register_item(self, item):
+        obj_id = getattr(item.obj, "id", None)
+
+        if obj_id is None:
+            return
+
+        self._items_by_object_id.setdefault(obj_id, []).append(item)
     # ---------------------- Model API ----------------------
     def index(self, row, column, parent):
         """Retourne l'index Qt pour une position donnée."""
@@ -297,8 +346,52 @@ class PipelineTreeModel(QAbstractItemModel):
                                     SignalGroupObject,
                                     SignalObject,)
                             )
-        
+    def _set_file_visibility(self, file_obj: FileObject, visible: bool):
+        impacted = []
 
+        for sig in file_obj.signals.values():
+            if sig.visible != visible:
+                sig.visible = visible
+                impacted.append(sig)
+
+        return impacted
+    
+    def _set_group_visibility(self, group: SignalGroupObject, visible: bool):
+        impacted = []
+
+        for ref in group.references.values():
+            sig = self.workspace.resolve_signal(ref.file_id, ref.signal_id)
+
+            if sig is None:
+                continue
+
+            if sig.visible != visible:
+                sig.visible = visible
+                impacted.append(sig)
+
+        return impacted
+
+    def _emit_check_state_updates(self, item, impacted_signals):
+        # parent + enfants directs
+        self._emit_check_state_refresh_for_item(item)
+        # autres occurrences éventuelles des mêmes signaux
+        for sig in impacted_signals:
+            self._emit_items_for_signal_changed(sig)
+            
+    def _emit_items_for_signal_changed(self, signal):
+        items = self._items_by_object_id.get(signal.id, [])
+
+        for item in items:
+            idx = self.index_from_item(item)
+
+            if idx.isValid():
+                self.dataChanged.emit(
+                    idx,
+                    idx,
+                    [Qt.ItemDataRole.CheckStateRole]
+                )
+
+            self._emit_ancestors_check_state_changed(item)
 # ---------------------- Gestion du text dynamique dans l'arborescence ----------------------
     def _signal_display_text(self, sig):
         if sig.item_type != itemType.RAW:
@@ -391,7 +484,6 @@ class PipelineTreeModel(QAbstractItemModel):
             
         if role == Qt.ItemDataRole.CheckStateRole and (self._is_checkable_object(obj)
                                                         and col == 0):
-            
             return self._check_state_for_object(obj)
         if role == Qt.ItemDataRole.ForegroundRole:
             return self._foreground_for_object(obj)
@@ -416,32 +508,23 @@ class PipelineTreeModel(QAbstractItemModel):
         item : TreeItem = index.internalPointer()
         obj = item.obj
         obj_type = obj.item_type
-        visible = value == 2
-
+        visible = value == 2 #2==Qt.CheckState.Checked
+        impacted_signals = []
         if obj_type == itemType.FILE:
-            obj.set_visible(visible)
-            self._emit_subtree_changed(item)
-            self._emit_visibility_context(item.to_selection_context())
-            
-            return True
+            impacted_signals = self._set_file_visibility(obj, visible)
+        elif obj_type == itemType.GROUP:
+            impacted_signals = self._set_group_visibility(obj, visible)
+        elif obj_type in (itemType.RAW,itemType.FILTER,itemType.ANALYSE):
+            if obj.visible !=visible:
+                obj.visible = visible
+                impacted_signals = [obj]
+        else:
+            return False
 
-        if obj_type == itemType.GROUP:
-            obj.set_visible(self.workspace, visible)
-            self._emit_global_check_refresh()
-            self._emit_visibility_context(item.to_selection_context())
-            #self._emit_subtree_changed(item)
-            return True
+        self._emit_check_state_updates(item, impacted_signals)
+        self.visibility_changed.emit(item.to_selection_context())
 
-        if obj_type in (itemType.RAW,itemType.FILTER,itemType.ANALYSE):
-            obj.visible = visible
-            self._emit_self_check_changed(item)
-            self._emit_ancestors_check_changed(item)
-            self._emit_global_check_refresh()
-            self._emit_visibility_context(item.to_selection_context())
-            
-            return True
-
-        return False
+        return True
 
     def flags(self, index):
         if not index.isValid():

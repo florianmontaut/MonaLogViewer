@@ -376,8 +376,7 @@ class MainController(QtCore.QObject):
 
     def _on_visibility_changed(self, ctx):
         signals = self._signals_from_context(ctx)
-        for sig in signals:
-            self.graph_ctrl.check_signal_visibiliy(sig)
+        self.graph_ctrl.update_signals_visibility(signals)
             
     def remove_selected_file(self):
         """

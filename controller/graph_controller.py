@@ -189,8 +189,24 @@ class GraphController(QtCore.QObject):
                     visible_indices.append(index)
 
         return visible_indices
+    
+    def update_signals_visibility(self, signals):
+        self.freeze_updates(True)
 
+        try:
+            for sig in signals:
+                self.update_signal_visibility(sig)
+        finally:
+            self.freeze_updates(False)
+            
+    def update_signal_visibility(self, sig):
+        curve = self.curves.get(sig)
 
+        if curve is None:
+            return
+
+        curve.setVisible(sig.visible)
+        
     def update_plots_layout(self, has_visible_digital_signals):
         """_summary_
 
